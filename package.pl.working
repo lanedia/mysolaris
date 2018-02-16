@@ -1,0 +1,1264 @@
+#!/usr/local/bin/perl -w
+
+########################################################################
+# $Id: package.pl 925 2009-02-18 10:24:56Z jackste $
+#
+# Script to package prepaid software into Solaris packages
+#
+# Written for Tecnomen Ireland
+# by John Madden (John.Madden@tecnomen.com)
+#
+# Usage: package.pl [-V] or [[-v <version>] [-p] [-r <release type>]]
+#     -V : verify $NID_DEV/scripts/packaging/package_defs.xml
+#     -v : release version (eg. 4.5.0.g.13)
+#     -p : optional, indicates patch release
+#     -r : optional, release type (HA, FT, ... - as definied in XML)
+########################################################################
+
+# Add direct INC paths to allow the executable to run via NFS from jupiter.
+BEGIN {
+    unshift @INC, '/net/den/usr/perl5.8.8/lib/site_perl';
+    unshift @INC, '/net/den/usr/perl5.8.8/lib/site_perl/5.8.8';
+    unshift @INC, '/net/den/usr/perl5.8.8/lib/site_perl/5.8.8/sun4-solaris';
+    unshift @INC, '/net/den/usr/perl5.8.8/lib/5.8.8';
+    unshift @INC, '/net/den/usr/perl5.8.8/lib/5.8.8/sun4-solaris';
+    unshift @INC, '/export/home/jackste/lib';
+}
+
+use strict;
+use utf8;
+use Getopt::Std;
+use Data::Dumper;
+use Term::ANSIColor;
+use Text::Wrap;
+
+# See `perldoc Tecnomen::Services::Release` for more information on the
+# Tecnomen::Services::Release module
+use Tecnomen::Services::Release;
+
+our $VERSION = '1.15';
+my $PWD = `pwd`;
+chomp($PWD);
+
+# Git root for build machine
+my $git_root = "$ENV{HOME}/.builds/voice";
+my $base;
+my $tag;
+
+# Set the number of columns to wrap output text at
+$Text::Wrap::columns = 72;
+
+sub GraceFullExit() {
+	print "\n" . color('bold blue') . "Ended : " . localtime() . "\n" . color('reset');
+	#exit(-1);
+}
+
+# Create a new Tecnomen::Services::Release object
+my $tr = new Tecnomen::Services::Release;
+
+my $err_mess   = "";
+
+# Validate the Tecnomen::Services::Release object - ensure everything has been set
+# up successfully
+if ( $tr->{'ret'} < 0 ) {
+    print color('bold red')
+      . "\nFailed :\n"
+      . color('reset')
+      . "\n\tUnable to validate Tecnomen::Services::Release object\n";
+    print wrap( "\t", '', $tr->{'error'} ) . "\n\n";
+    exit( $tr->{'ret'} );
+}
+
+# Get the script name from the commandline
+$0 =~ m/(.*\/)?(.*)$/;
+my ($this) = $2;
+
+# Get the command line options
+my (%options) = ();
+getopts( "aVv:pr:d", \%options );
+
+print "\n" . color('bold blue') . "Started : " . localtime() . "\n" . color('reset');
+
+# If the -V option is provided, then just do the validation and exit
+if ( defined $options{'V'} ) {
+    print "\n" . color('bold blue') . "Info :\n" . color('reset');
+    print wrap( "\t", '',
+            "Validating "
+          . $ENV{'NID_DEV'}
+          . "/scripts/packaging/package_defs.xml ..." )
+      . "\n";
+    if ( $tr->validate_xml() ) {
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $tr->{'error'} ) . "\n\n";
+		GraceFullExit();
+        exit( $tr->{'ret'} );
+    }
+    else {
+        print color('bold green') . "\nPassed" . color('reset') . "\n";
+		GraceFullExit();
+        exit(0);
+    }
+}
+
+# Print the package_builder and module versions for debugging.
+if ( $options{'d'} ) {
+    print color('bold green') . "Info :\n" . color('reset') . "\n";
+    print "\t",
+        "package_builder             version = $VERSION\n" . "\t"
+      . "Tecnomen::Services::Release version = "
+      . Tecnomen::Services::Release->VERSION() . "\n\n";
+	GraceFullExit();
+    exit(-1);
+}
+
+# A version is required
+my ($version) = $options{'v'};
+if ( !$version ) {
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '',
+            "You must supply a package version number for the release. " 
+          . "Rerun "
+          . $this
+          . " with the -v parameter, followed by the "
+          . "version number for the package. " . "(eg. "
+          . $this
+          . " -v 4.4.0.b.19)" )
+      . "\n\n";
+	GraceFullExit();
+    exit(-1);
+}
+
+# Strip "Prepaid_" from version tag since this is added later..
+$version =~ s/^Prepaid_//;
+
+# Check that the version string matches the standard tags. This is a
+# non-fatal warning to allow for one-off packages built with unusual labels.
+if ( $version !~ m/^(\d+\.){3,4}[a-z]/ ) {
+
+    print color('bold red') . "\nWarning" . color('reset') . "\n";
+
+    print "Version string: $version doesn't appear to match standard tags.\n";
+    print "\nContinue? (y/n) [y] ";
+
+    my $response = <STDIN>;
+
+    if ( $response =~ /^n/i ) {
+		GraceFullExit();
+        exit(-1);
+    }
+}
+
+$tr->set_version($version);
+
+# If the version tag looks like a patch label but the users hadn't specified
+# the -p commandline option then ask if they wish to build a patch.
+if ( !defined $options{'p'} && $version =~ m/^(\d+\.){3,4}[a-z]\.\d+/ ) {
+
+    print color('bold red') . "\nWarning" . color('reset') . "\n";
+
+    print "\tVersion string: $version looks like a patch label but you ";
+    print "haven't specified -p on the commandline.\n\n";
+    print "\tDo you wish to add -p and build a patch? (y/n) [y] ";
+
+    my $response = <STDIN>;
+
+    if ( $response =~ /^\s+$/ || $response =~ /^y/i ) {
+        $options{'p'} = 1;
+    }
+}
+
+# Patch and release type are optional
+my ($patch) = ( defined $options{'p'} ) ? 1 : undef;
+
+# Check that the patch and base labels exist.
+if ( defined $options{'p'} ) {
+    if ( -d $git_root){
+        chdir($git_root);
+    }
+
+    if ( system("git fetch --tags") ) {
+        print color('bold red') . "\nFailed : \n" . color('reset') . "\n\tCould not fetch git tags\n";
+        print NORM_LOG "\n\tERROR : Failed to git fecth tags\n";
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+
+    $base = $version;
+    $base =~ s/([\d.]+[a-z]).*/Prepaid_$1.BLD/;
+
+# Code to compare with the latest base patch   
+    my @bases = `git tag | grep $base*`;
+    my $base_bld = @bases;
+    $base .= $base_bld;
+
+    $tag  = 'Prepaid_' . $version;
+    my @tags = `git tag`;
+
+    # Check that the patch tag exists.
+    if (  !grep( /^$tag$/, @tags ) ) {
+        $err_mess = "Couldn't find patch tag '$tag'";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print "\t$err_mess\n\n";
+
+        GraceFullExit();
+        exit(-1);
+    }
+
+    # Check that the base tag exists.
+    if (  !grep( /^$base$/, @tags ) ) {
+        $err_mess = "Couldn't find base tag '$base'";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print "\t$err_mess\n\n";
+
+	GraceFullExit();
+        exit(-1);
+    }
+}
+
+
+my $error_log  = '/tmp/Prepaid_'.$version.'.err';
+my $normal_log = '/tmp/Prepaid_'.$version.'.log';
+
+if ( !defined( open( NORM_LOG, ">", $normal_log ) ) ) {
+    print color('bold red')
+      . "\nFailed : \n"
+      . color('reset')
+      . "\n\tCould not open $normal_log for writing : $!\n\n";
+	GraceFullExit();
+    exit(-1);
+}
+
+print NORM_LOG localtime() . "\n";
+print NORM_LOG "\nCOMMAND : chmod 666 $normal_log\n";
+if ( system("chmod 666 $normal_log >>$normal_log 2>&1") ) {
+    print color('bold red')
+      . "\nFailed : \n"
+      . color('reset')
+      . "\n\tCould not chmod $normal_log : $!\n\n";
+    print NORM_LOG "\n\tERROR : Failed to chmod $normal_log\n";
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+if ( !defined( open( ERR_LOG, ">", $error_log ) ) ) {
+    print color('bold red')
+      . "\nFailed : \n"
+      . color('reset')
+      . "\n\tCould not open $error_log for writing : $!\n\n";
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+print ERR_LOG localtime() . "\n";
+print ERR_LOG "\nCOMMAND : chmod 666 $error_log\n";
+if ( system("chmod 666 $error_log >>$error_log 2>&1") ) {
+    print color('bold red')
+      . "\nFailed : \n"
+      . color('reset')
+      . "\n\tCould not chmod $error_log : $!\n\n";
+    print ERR_LOG "\n\tERROR : Failed to chmod $error_log\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+##############################################################################
+# sub call_make()
+#
+# Calls make using back tics so we can capture the output and check for errors
+# NOTE : This is necessary becuase the make files do not return errors back to
+# the program
+#
+# Arguments : The make command
+##############################################################################
+sub call_make {
+
+    my $make_command = $_[0];
+    my $make_result  = "";
+
+    $make_result = `$make_command 2>&1`;
+
+    if ( $make_result =~ /make: Fatal error:/ ) {
+
+        print color('bold red')
+          . "\nFailed :\n "
+          . color('reset')
+          . "\n\t$make_command Failed\n\n";
+
+        print ERR_LOG $make_result;
+		    print NORM_LOG "$make_command Failed\n";
+
+        print color('bold red')
+          . "\n\tOutput has been recorded in "
+          . $error_log . " \n\n"
+          . color('reset');
+
+        return (-1);
+    }
+
+    print "\n" . color('bold blue') . "Info :\n" . color('reset');
+    print "\t$make_command Completed Successfully\n";
+    print NORM_LOG "$make_command Completed Successfully\n";
+    return (0);
+}
+
+if ( $tr->validate_xml() ) {
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $tr->{'error'} ) . "\n\n";
+    print ERR_LOG "\nUnable to validate package_defs.xml\n";
+    print ERR_LOG "\t", '', $tr->{'error'} . "\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit( $tr->{'ret'} );
+}
+
+print "\n" . color('bold blue') . "Info :\n" . color('reset');
+print "\tParameter and XML Check OK\n";
+print NORM_LOG "Parameter and XML Check OK\n";
+
+# Default release type to HA
+my ($release_type) = ( defined $options{'r'} ) ? $options{'r'} : 'HA';
+
+# Remove $NID_EXTERNAL
+if ( ( system( "rm -rf " . $ENV{'NID_EXTERNAL'} ) ) != 0 ) {
+    $err_mess = "Couldn't remove " . $ENV{'NID_EXTERNAL'} . " : $!";
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+# Build the software
+
+if ( !chdir $ENV{'NID_DEV'} ) {
+    $err_mess = "Could not find" . $ENV{'NID_DEV'} . " : $!";
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess \n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+if ( call_make("make clean uninstall") != 0 ) {
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+if ( call_make("make gprs") != 0 ) {
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+if (
+    (
+        system(
+                "cp -f "
+              . $ENV{'NID_DEV'}
+              . "/in_service/pp/scf_pp "
+              . $ENV{'NID_DEV'}
+              . "/in_service/bin/scf_pp_gprs"
+        )
+    ) != 0
+  )
+{
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    my ($why) = "";
+    if ( !-f $ENV{'NID_DEV'} . "/in_service/pp/scf_pp" ) {
+        $why = " : file doesn't exist";
+    }
+    else {
+        $why = " : unknown error";
+    }
+
+    $err_mess = "Couldn't copy scf_pp to scf_pp_gprs";
+    print wrap( "\t", '', $err_mess . $why ) . "\n\n";
+    print ERR_LOG "\n$err_mess - " . $why . "\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+if ( call_make("make clean uninstall") != 0 ) {
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+if ( call_make("make") != 0 ) {
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+if ( call_make("make external lab service") != 0 ) {
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+# Location of the SCM build information file
+my $build_info = "/tmp/SCMVariableData.txt";
+
+if ( -e $build_info ) {
+
+    if ( system("rm $build_info") != 0 ) {
+        $err_mess = "Failed to delete $build_info";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+}
+
+# Do the patch preparation if required
+if ($patch) {
+    # Use `git diff` to find the differences (but not the deleted files using diff-filter)
+    #, and grep out only the file names.
+    if ( -d $git_root){
+        chdir($git_root);
+    }
+    my @git_diff = `git diff --diff-filter=ACMRTUXB --name-only $base $tag`;
+    if (@git_diff == 0) {
+        $err_mess = "Error executing `git diff` : ";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess . $! ) . "\n\n";
+        print ERR_LOG "\n$err_mess" . $! . "\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+    print "\n" . color('bold blue') . "Info :\n" . color('reset');
+    print "\tgit diff completed Successfully\n";
+    print NORM_LOG "git diff completed Successfully\n";
+   
+    # Copy the current directories (with full contents) to a backup
+    my ($cf)   = $ENV{'NID_EXTERNAL'} . "/config_" . $ENV{'NID_RELEASE'};
+    my ($cf_f) = $cf . "_full";
+    my ($tcf)   = $ENV{'NID_EXTERNAL'} . "/tconfig_" . $ENV{'NID_RELEASE'};
+    my ($tcf_f) = $tcf . "_full";
+    my ($db)   = $ENV{'NID_EXTERNAL'} . "/db_" . $ENV{'NID_RELEASE'};
+    my ($db_f) = $db . "_full";
+
+    # Exit if the config directory doesn't exist
+    if ( !-d $cf ) {
+        $err_mess =
+            $cf
+          . " doesn't exist (is \$NID_RELEASE environment variable "
+          . "set correctly?)";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+
+    # Remove the full directory if it already exists
+    if ( -d $cf_f ) {
+        if ( ( system( "rm -rf " . $cf_f ) ) != 0 ) {
+            $err_mess = "Failed to remove " . $cf_f . " : " . $!;
+            print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+            print wrap( "\t", '', $err_mess ) . "\n\n";
+            print ERR_LOG "\n$err_mess\n\n";
+            close ERR_LOG;
+            close NORM_LOG;
+	GraceFullExit();
+            exit(-1);
+        }
+    }
+
+    # Move config to config_full
+    if ( ( system( "mv " . $cf . " " . $cf_f ) ) != 0 ) {
+        $err_mess = "Failed to move " . $cf . " to " . $cf_f . " : " . $!;
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+
+    # DON'T Exit if the tconfig directory doesn't exist
+	# It will not exist on a pre 4.5 system
+    if ( !-d $tcf ) {
+        $err_mess =
+            $tcf
+          . " doesn't exist (is \$NID_RELEASE environment variable "
+          . "set correctly?)";
+        print ERR_LOG "\n$err_mess\n";
+		print ERR_LOG "NOTE - This is OK if it is a pre 4.5 build\n\n";
+    }
+
+    # Remove the full directory if it already exists
+    if ( -d $tcf_f ) {
+        if ( ( system( "rm -rf " . $tcf_f ) ) != 0 ) {
+            $err_mess = "Failed to remove " . $tcf_f . " : " . $!;
+            print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+            print wrap( "\t", '', $err_mess ) . "\n\n";
+            print ERR_LOG "\n$err_mess\n\n";
+            close ERR_LOG;
+            close NORM_LOG;
+	GraceFullExit();
+            exit(-1);
+        }
+    }
+
+    # Move config to tconfig_full
+    if ( ( system( "mv " . $tcf . " " . $tcf_f ) ) != 0 ) {
+        $err_mess = "Failed to move " . $tcf . " to " . $tcf_f . " : " . $!;
+        print ERR_LOG "\n$err_mess\n\n";
+		print ERR_LOG "NOTE - This is OK if it is a pre 4.5 build\n\n";
+    }
+
+    # Exit if the db directory isn't there
+    if ( !-d $db ) {
+        $err_mess =
+            $db
+          . " doesn't exist (is \$NID_RELEASE environment variable "
+          . "set correctly?)";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+
+    # Remove the full directory if it already exists
+    if ( -d $db_f ) {
+        if ( ( system( "rm -rf " . $db_f ) ) != 0 ) {
+            $err_mess = "Failed to remove " . $db_f . " : " . $!;
+            print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+            print wrap( "\t", '', $err_mess ) . "\n\n";
+            print ERR_LOG "\n$err_mess\n\n";
+            close ERR_LOG;
+            close NORM_LOG;
+	GraceFullExit();
+            exit(-1);
+        }
+    }
+
+    # Move db to db_full
+    if ( ( system( "mv " . $db . " " . $db_f ) ) != 0 ) {
+        $err_mess = "Failed to move " . $db . " to " . $db_f . " : " . $!;
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+
+    # Create the directories again
+    if ( ( system( "mkdir -p " . $cf ) ) != 0 ) {
+        $err_mess = "Failed to create " . $cf . " : " . $!;
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+    if ( ( system( "mkdir -p " . $tcf ) ) != 0 ) {
+        $err_mess = "Failed to create " . $tcf . " : " . $!;
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+    if ( ( system( "mkdir -p " . $db ) ) != 0 ) {
+        $err_mess = "Failed to create " . $db . " : " . $!;
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+    
+    my ( $f, $d);
+    foreach $f (@git_diff){
+        chomp($f);
+        $d = "";
+        # .txt files - no renaming, just copy
+        if ( $f =~ /labconfig\/config\/pp\/smpp/ ) {
+            $f =~ s/^.*labconfig\/config\/pp//;
+            if (
+                system(
+                        "cp " 
+                      . $cf_f . "/" 
+                      . $f . " " 
+                      . $cf . "/" 
+                      . $f
+                      . " >/dev/null 2>&1"
+                ) != 0
+              )
+            {
+
+                $err_mess =
+                    "Failed to copy .txt files from " 
+                  . $cf_f . "/" 
+                  . $f . " to "
+                  . $cf . "/"
+                  . $f . ": "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+
+        }
+        # template files - no renaming, just copy
+        # NOTE - This only copies files to NID_EXTERNAL. In most branches 
+        # the tconfig is NOT copied to the package as it is specifically
+        # excluded by a line in package_defs.xml - Beware
+        if ( $f =~ /labconfig\/config\/pp\/templates/ ) {
+            $f =~ s/^.*labconfig\/config\/pp\/templates//;
+            if (
+                system(
+                        "cp " 
+                      . $tcf_f . "/" 
+                      . $f . " " 
+                      . $tcf . "/" 
+                      . $f
+                      . " >/dev/null 2>&1"
+                ) != 0
+              )
+            {
+
+                $err_mess =
+                    "Failed to copy template files from " 
+                  . $tcf_f . "/" 
+                  . $f . " to "
+                  . $tcf . "/"
+                  . $f . ": "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+
+        }
+        # USSD .txt files - no renaming, just copy
+        if ( $f =~ /labconfig\/config\/pp\/ussd\/ussdpp/ ) {
+            $f =~ s/^.*labconfig\/config\/pp//;
+
+            ($d) = $f =~ m/(.*\/).*$/;
+            if ( system( "mkdir -p " . $cf . "/" . $d ) != 0 ) {
+
+                $err_mess =
+                    "Failed to create USSD directory " 
+                  . $cf . "/" 
+                  . $d . " : "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+
+            if (
+                system(
+                        "cp " 
+                      . $cf_f . "/" 
+                      . $f . " " 
+                      . $cf . "/" 
+                      . $f
+                      . " >/dev/null 2>&1"
+                ) != 0
+              )
+            {
+
+                $err_mess =
+                    "Failed to copy USSD .txt files from " 
+                  . $cf_f . "/" 
+                  . $f . " to "
+                  . $cf . "/"
+                  . $f . ": "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+
+        }
+
+        # SQL initialdata - no renaming, just copy
+        if (   ( $f =~ /labconfig\/db\/pp\/initialdata/ )
+            || ( $f =~ /labconfig\/db\/si\/initialdata/ ) )
+        {
+            $f =~ s/^.*labconfig\/db//;
+            ($d) = $f =~ m/(.*\/).*$/;
+            if ( system( "mkdir -p " . $db . "/" . $d ) != 0 ) {
+
+                $err_mess =
+                    "Failed to create DB directory " 
+                  . $db . "/" 
+                  . $d . " : "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+            if (
+                system(
+                        "cp " 
+                      . $db_f . "/" 
+                      . $f . " " 
+                      . $db . "/" 
+                      . $f
+                      . " >/dev/null 2>&1"
+                ) != 0
+              )
+            {
+
+                $err_mess =
+                    "Failed to copy initialdata from " 
+                  . $db_f . "/" 
+                  . $f . " to "
+                  . $db . "/"
+                  . $f . ": "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+        }
+        # SQL files - no renaming, just copy
+        if ( $f =~ /in_service\/db/ ) {
+            $f =~ s/^.*in_service\/db//;
+            ($d) = $f =~ m/(.*\/).*$/;
+            if ( system( "mkdir -p " . $db . "/" . $d ) != 0 ) {
+
+                $err_mess =
+                    "Failed to create DB directory " 
+                  . $db . "/" 
+                  . $d . " : "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+            if (
+                system(
+                        "cp " 
+                      . $db_f . "/" 
+                      . $f . " " 
+                      . $db . "/" 
+                      . $f
+                      . " >/dev/null 2>&1"
+                ) != 0
+              )
+            {
+
+                $err_mess =
+                    "Failed to copy initialdata from " 
+                  . $db_f . "/" 
+                  . $f . " to "
+                  . $db . "/"
+                  . $f . ": "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+
+            }
+        }
+
+        # .ini files - rename to .ini.default
+        if (   ( $f =~ /labconfig\/config\/pp/ )
+            && ( $f !~ /\.txt/ )
+            && ( $f !~ /template/ ) )
+        {
+            $f =~ s/^.*labconfig\/config\/pp//;
+            if ( $f =~ /\.ini/ ) {
+                if (
+                    system(
+                            "cp " 
+                          . $cf_f . "/" 
+                          . $f . " " 
+                          . $cf . "/" 
+                          . $f
+                          . ".default "
+                          . " >/dev/null 2>&1"
+                    ) != 0
+                  )
+                {
+
+                    $err_mess =
+                        "Failed to copy .ini files from " 
+                      . $cf_f . "/" 
+                      . $f . " to "
+                      . $cf . "/"
+                      . $f
+                      . ".default " . ": "
+                      . $!;
+                    print color('bold red')
+                      . "\nFailed :\n"
+                      . color('reset') . "\n";
+                    print wrap( "\t", '', $err_mess ) . "\n\n";
+                    print ERR_LOG "\n$err_mess\n\n";
+                    close ERR_LOG;
+                    close NORM_LOG;
+	GraceFullExit();
+                    exit(-1);
+
+                }
+            }
+            else {
+
+                if ( $f !~ /dbPasswd/ ) {
+
+                    # Special case for non-ini files (eg .json) in config
+                    # directory that aren't to be renamed to .default
+                    if (
+                        system(
+                                "cp " 
+                              . $cf_f . "/" 
+                              . $f . " " 
+                              . $cf . "/" 
+                              . $f
+                              . " >/dev/null 2>&1"
+                        ) != 0
+                      )
+                    {
+
+                        $err_mess =
+                            "Failed to copy non .ini files from " 
+                          . $cf_f . "/"
+                          . $f . " to "
+                          . $cf . "/"
+                          . $f . ": "
+                          . $!;
+                        print color('bold red')
+                          . "\nFailed :\n"
+                          . color('reset') . "\n";
+                        print wrap( "\t", '', $err_mess ) . "\n\n";
+                        print ERR_LOG "\n$err_mess\n\n";
+                        close ERR_LOG;
+                        close NORM_LOG;
+	GraceFullExit();
+                        exit(-1);
+                    }
+                }
+            }
+        }
+
+        # .ini files - rename to .ini.default
+        if (   ( $f =~ /labconfig\/config/ )
+            && ( $f !~ /labconfig\/config\/pp/ )
+            && ( $f !~ /template/ ) )
+        {
+            $f =~ s/^.*labconfig\/config//;
+            if (
+                system(
+                        "cp " 
+                      . $cf_f . "/" 
+                      . $f . " " 
+                      . $cf . "/" 
+                      . $f
+                      . ".default "
+                      . " >/dev/null 2>&1"
+                ) != 0
+              )
+            {
+
+                $err_mess =
+                    "Failed to copy .ini files from " 
+                  . $cf_f . "/" 
+                  . $f . " to "
+                  . $cf . "/"
+                  . $f
+                  . ".default " . ": "
+                  . $!;
+                print color('bold red')
+                  . "\nFailed :\n"
+                  . color('reset') . "\n";
+                print wrap( "\t", '', $err_mess ) . "\n\n";
+                print ERR_LOG "\n$err_mess\n\n";
+                close ERR_LOG;
+                close NORM_LOG;
+	GraceFullExit();
+                exit(-1);
+            }
+        }
+    }
+    if ( ! -d $git_root) {
+        if ( ( system( "git tag -d $tag" ) ) != 0 ) {
+            $err_mess = "Failed to delete local tag  " . $tag . " : " . $!;
+            print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+            print wrap( "\t", '', $err_mess ) . "\n\n";
+            print ERR_LOG "\n$err_mess\n\n";
+            close ERR_LOG;
+            close NORM_LOG;
+            GraceFullExit();
+            exit(-1);
+        }
+    }
+}
+
+# Build the package directories
+chdir($PWD);
+if ( call_make("make release_main_all") != 0 ) {
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+print "\n\n";
+
+# Get the available types set up in the xml and check it against the
+# user passed in option, if given
+my (@release_types) = $tr->get_release_types();
+if ( defined $options{'r'} ) {
+    my ($found) = 0;
+    foreach (@release_types) {
+        if ( $release_type =~ /$_/i ) {
+            $found = 1;
+            last;
+        }
+    }
+    if ( !$found ) {
+        $err_mess =
+            "The release type provided ("
+          . $release_type
+          . ") is not "
+          . "supported in the package definitions XML file at "
+          . $ENV{'NID_DEV'}
+          . "/scripts/packaging/package_defs.xml";
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+
+    $release_type =~ tr/a-z/A-Z/;
+}
+
+# Set the release type
+if ( $tr->set_release_type($release_type) < 0 ) {
+    $err_mess = "FAILED to set release type\n" . $tr->{'error'};
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit( $tr->{'ret'} );
+}
+print "\n" . color('bold blue') . "Info :\n" . color('reset');
+print wrap( "\t", '', "Set release type to " . $release_type ) . "\n";
+print NORM_LOG "Set release type to " . $release_type . "\n";
+
+# Get the available package types set up in the XML
+# Not required in this script, only here as an illustration
+#my(@package_types) = $tr->get_package_types();
+
+# Set the package type
+if ($patch) {
+    if ( $tr->set_package_type('patch') < 0 ) {
+        $err_mess = "Failed to set package type\n" . $tr->{'error'};
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit( $tr->{'ret'} );
+    }
+    print "\n" . color('bold blue') . "Info :\n" . color('reset');
+    print wrap( "\t", '', "Set package type to patch" ) . "\n";
+    print NORM_LOG "Set package type to patch" . "\n";
+}
+else {
+    if ( $tr->set_package_type('base') < 0 ) {
+        $err_mess = "Failed to set package type\n" . $tr->{'error'};
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit( $tr->{'ret'} );
+    }
+    print "\n" . color('bold blue') . "Info\n" . color('reset');
+    print wrap( "\t", '', "Set package type to base" ) . "\n";
+    print NORM_LOG "Set package type to base" . "\n";
+}
+
+# Prepare packages : create and copy in required files (eg. copyright,
+# pkginfo, postinstall scripts etc.) as defined in the XML
+if ( $tr->prepare_packages() ) {
+    $err_mess = "Failed to prepare package\n" . $tr->{'error'};
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+print "\n" . color('bold blue') . "Info :\n" . color('reset');
+print wrap( "\t", '', "Package directories prepared" ) . "\n";
+print NORM_LOG "Package directories prepared" . "\n";
+
+# Finally, create the output packages
+if ( $tr->create_packages() ) {
+    $err_mess = "Failed to create packages\n" . $tr->{'error'};
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit( $tr->{'ret'} );
+}
+print "\n" . color('bold blue') . "Info :\n" . color('reset');
+print wrap( "\t", '',
+    "Package(s) created in " . $ENV{'HOME'} . "/releases/packages/" )
+  . "\n";
+print NORM_LOG "Package(s) created in "
+  . $ENV{'HOME'}
+  . "/releases/packages/" . "\n";
+
+
+# Save $NID_EXTERNAL 
+
+# Remove the saved directory if it already exists
+# This would be the case if we were rebuilding an existing package
+
+my $saved_ext = $ENV{'NID_EXTERNAL'} . "_Prepaid_" . $version;
+
+if ( -d $saved_ext ) {
+    if ( ( system( "rm -rf " . $saved_ext ) ) != 0 ) {
+        $err_mess = "Failed to remove " . $saved_ext . " : " . $!;
+        print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+        print wrap( "\t", '', $err_mess ) . "\n\n";
+        print ERR_LOG "\n$err_mess\n\n";
+        close ERR_LOG;
+        close NORM_LOG;
+	GraceFullExit();
+        exit(-1);
+    }
+}
+
+if ( ( system( "mv " . $ENV{'NID_EXTERNAL'} . " " . $saved_ext ) ) != 0 ) {
+    $err_mess = "Failed to save " . $ENV{'NID_EXTERNAL'} . " to " . $saved_ext . " : " . $!;
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess\n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+# Remove $NID_DEV
+
+if ( !chdir $ENV{'HOME'} ) {
+    $err_mess = "Could not find" . $ENV{'HOME'} . " : $!";
+    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+    print wrap( "\t", '', $err_mess ) . "\n\n";
+    print ERR_LOG "\n$err_mess \n\n";
+    close ERR_LOG;
+    close NORM_LOG;
+	GraceFullExit();
+    exit(-1);
+}
+
+# Removing folder for the package. Not needed at the moment
+#if ( ( system( "rm -rf " . $ENV{'NID_DEV'} ) ) != 0 ) {
+#    $err_mess = "Couldn't remove " . $ENV{'NID_DEV'} . " : $!";
+#    print color('bold red') . "\nFailed :\n" . color('reset') . "\n";
+#    print wrap( "\t", '', $err_mess ) . "\n\n";
+#    print ERR_LOG "\n$err_mess\n\n";
+#   close ERR_LOG;
+#   close NORM_LOG;
+#	GraceFullExit();
+#    exit(-1);
+#}
+
+print "\n" . color('bold blue') . "Info :\n" . color('reset');
+print "\t Clean up Performed - NID_DEV removed NID_EXTERNAL renamed\n";
+print NORM_LOG "Clean up Performed - NID_DEV removed NID_EXTERNAL renamed\n";
+
+close ERR_LOG;
+close NORM_LOG;
+
+# Start of POD documentation for package.pl
+__END__
+
+=head1 NAME
+
+package.pl - a Perl script to build and package Tecnomen software into
+Solaris packages.
+
+=head1 SYNOPSIS
+
+Build and package software
+
+    package.pl -v <version> [-p] [-r <release type>]
+
+    package.pl -v 4.5.0.g
+
+Verify package_defs.xml
+
+    package.pl -V
+
+
+
+=head1 DESCRIPTION
+
+This script builds and packages Tecnomen software for release. The
+following are the command line parameters for package.pl.
+
+=over 4
+
+=item * -v <version>
+
+This is the software version being released.
+
+One thing to remember here is that this version is used to get both the
+base and patch release versions. If the package is a patch release, then
+the last '.' delimited character in the version is presumed to be the
+patch number, the rest (excluding the last '.' delimited character) is
+presumed to be the base release. These are used to get the differences
+between base and patch release (using Subversion) by prepending
+'$PREPAID/tags/Prepaid_' to the base and patch release numbers and
+diffing them.
+
+=item * -p
+
+Include this command line switch if the package being released is a
+patch package.
+
+This switch causes the script to only include in the package those files
+which have changed between the base and patch packages (except binaries
+- all binaries are released in every package).
+
+=item * -r <release type>
+
+This parameter tells the script to build the packages for a specific
+release type. This release type must be defined in the F<package_defs.xml> file.
+This defaults to 'HA'.
+
+=item * -V
+
+This validates the F<package_defs.xml> file, ensuring it is properly
+formatted to create packages using the B<Tecnomen::Services::Release> module.
+
+The packages aren't actually created when this switch is passed. The
+script simply validates the XML file and exits.
+
+=back
+
+
+
+=head1 EXAMPLES
+
+Release a B<4.5.0.g> base package
+
+    package.pl -v 4.5.0.g
+
+
+Release a B<4.5.0.g.13> patch package
+
+    package.pl -v 4.5.0.g.13 -p
+
+
+Release a fault tolerant (type 'FT') B<4.5.0.g.13> patch package
+(presuming XML is already configured to build FT packages)
+
+    package.pl -v 4.5.0.g.13 -p -r FT
+
+Verify F<$NID_DEV/scripts/packaging/package_defs.xml> is properly
+formatted
+
+    package.pl -V

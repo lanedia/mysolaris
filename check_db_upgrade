@@ -1,0 +1,383 @@
+#!/net/den/usr/local/bin/perl -w
+#
+# Written for Tecnomen Ireland Services Group
+# by Steve Jack 
+#
+# Usage : check_db_upgrade -r <release> -p <path to prepaid source>
+#
+# Checks for a properly named upgrade script 
+#
+
+BEGIN{push @INC, "/net/den/usr/local/lib/perl5/5.8.7"} use Getopt::Std;
+use Term::ANSIColor;
+
+
+$VERSION = '1.1';
+
+select(STDERR); $| = 1;
+select(STDOUT); $| = 1;
+
+@path = split("/", $0);
+$self = $path[$#path];
+$just_check = 0;
+$automated = 0;
+
+sub Usage() {
+	print "\n";
+	print "Usage $self\n";
+	print "      -h : Show this help message\n";
+	print "      -v : Print version and exit\n";
+	print "      -l : Path to a logfile to use (default /tmp/check_db_upgrade.log)\n";
+	print "      -r : Release label (eg. 4.3.7.0.c.510)\n";
+	print "      -p : Path to the prepaid source\n";
+	print "      -o : Override previous patch number\n";
+	print "      -c : Just check - don't rename\n";
+	print "\n";
+	print "-h and -v don't take an argument, and exit immediately.\n";
+	print "\n";
+	print "At least -r and -p are required for preparing a release.\n";
+	print " -o takes a patch number otherwise it is assumed to be 'this patch' - 1\n";
+	print " -c Only warning messages are given - no rename is performed.\n";
+	print "\n";
+	exit 0
+}
+
+sub Version() {
+	print "\n";
+	print "$self version $VERSION\n\n";
+	print "Written by John Madden (John.Madden\@tecnomen.com)\n";
+	print "For Tecnomen Ireland Services Group\n";
+	print "\n";
+	exit 0;
+}
+
+sub check_db_upgrade() {
+  my $patch_level;
+  my $base_level;
+  my $patch_prefix;
+  my $base_letter;
+  my $previous_patch_level;
+  my $upgrade = "upgrade_";
+  my $next_patch_after = "_to_next_patch_after_";
+  my $to = "_to_";
+  my $sql_ext = ".sql";
+  my $upgrade_prev;
+  my $upgrade_next_patch_after;
+  my $upgrade_current;
+  my $upgrade_path = $prepaid."/in_service/db/pp/upgrades/";
+  my $pre_45 = 0;  
+  my $post_45 = 0;  
+  my $patch_base = "";
+  my $environ = "";
+
+  if ( $release =~ m/(.*)\.(.*)$/ ) {
+      $base_level = $1;
+      $patch_level = $2;
+      print "\nProvided patch_level = $patch_level\n";
+      $patch_len= length $patch_level;
+        if($patch_len > 4) {
+            $str1=substr($patch_level,3);
+            $patch_level=$str1;      
+            print "Splitting patch as its a development branch - patch_level = $patch_level\n";
+        }
+        print "\nPatch_level to use = $patch_level\n";
+  }
+  else {
+      print "Couldn't match: $release\n";
+      exit 1;
+  }
+
+  $base_level =~ m/(.*)\.(.*)$/;
+  $patch_prefix = $1;
+  $base_letter  = $2;
+
+# Determine what environment we are in pre or post 4.5
+
+	@output = `uname -r`;
+  
+	foreach (@output) {
+		if( /^\d+/ ) {
+			$_ =~ s/^//;
+			$environ = $_;
+			chomp($environ);
+		}
+	}
+
+	if($environ == "5.10") {
+     print " -o- Environment is POST 4.5\n";
+	}
+	elsif  ($environ == "5.8") {
+     print " -o- Environment is PRE 4.5\n";
+	}
+	
+  $release =~ m/(.*?)\.(.*?)\.(.*)$/;
+  $first = $1;
+  $second  = $2;
+  if($first <= 4 && $second < 5) {
+   
+     print " -o- Release is PRE 4.5\n";
+     $pre_45 = 1;     
+  }else {
+    
+     print " -o- Release is POST 4.5\n";
+     $post_45 = 1;
+  }
+  
+#NOTE if this is pre 4.5 the upgrade scripts do not operate on a base release but on a designated patch release.
+#     which is deemed the patch base. This is so pre 4.5 and 4.5 can have a similar upgrade philosphy going forward
+#     this number is held in a file called patch_info.mak. Other information may be added to this file in the future.
+#     For post 4.5 branches and new pre 4.5 ones this file will exist but the number will be null.
+
+	if( !defined(open(PATCHINFO, "<", $prepaid."/control/rules/patch_info.mak")) ) {
+		print color('bold red')."\nFatal error : ".color('reset')."Cannot open patch_info.mak : $!\n\n";
+		die "\n";
+	}
+  while (<PATCHINFO>) 
+	{
+   	  chomp;
+     	$thisline = $_;
+
+			if($thisline =~ /^Patch Base No: \d+/ ) {
+				$_ =~ s/^Patch Base No: //;
+				$patch_base = $_;
+				chomp($patch_base);
+   			print " -o- Patch Base No is  ",$patch_base,"\n";
+   			$patch_base = ".".$patch_base;
+			}
+
+ 	} # End of while()
+
+	if( !(close(PATCHINFO)) ) {
+		print color('bold red')."\nFatal error : ".color('reset')."Cannot close patch_info.mak : $!\n\n";
+		die "\n";
+	}
+  	
+	if($patch_level ge "400") {
+		$previous_patch_level = "305";
+  		$base_level = "$patch_prefix.$previous_patch_level";
+		print " -o- Patch Base level is  ",$patch_prefix,"\n";
+	}
+	elsif($patch_level ge "271") {
+		$previous_patch_level = "270";
+  		$base_level = "$patch_prefix.$previous_patch_level";
+		print " -o- Patch Base level is  ",$patch_prefix,"\n";
+	}
+	elsif($patch_level ge "300") {
+ 		$base_level = $base_level.$patch_base;
+		print " -o- Patch Base level is  ",$base_level,"\n";
+		$previous_patch_level = $patch_level - 1;
+	}
+	else {
+ 		$base_level = $base_level.$patch_base;
+		print " -o- Patch Base level is  ",$base_level,"\n";
+		$previous_patch_level = $patch_level - 1;
+	}
+  
+  
+
+# Unless it is overriden  
+  if( $options{o}) {
+      if($options{o} =~ m/^\d+$/) {
+			
+			  $previous_patch_level = $options{o};
+				
+				if($previous_patch_level >= $patch_level) {
+					print LOG "\nFATAL : Invalid Patch level";
+					close(LOG);
+					print color('bold red')."\nFatal error : \n".color('reset')."Invalid Overide Patch level.\n";
+					die "\n";
+				}
+			}	else {
+				print LOG "\nFATAL : Invalid override option";
+				close(LOG);
+				print color('bold red')."\nFatal error : \n".color('reset')."Invalid override option - must be patch number.\n";
+				die "\n";
+	
+			}
+
+	}
+
+	print " -o- Previous Patch level is  ",$previous_patch_level,"\n";
+
+if( $automated ) {
+    print "Using Automated script, skipping manual checks\n  ";
+} else {
+	if($pre_45 && $environ == "5.10") {
+    
+    print "You are trying to build a pre 4.5 release in a 4.5 environment \nIs this correct ? [y/n]  ";
+		$ans = <STDIN>;
+		if( !($ans =~ /^y/i) ) {
+	  	print LOG "\nERROR : Trying to build a pre 4.5 release in a 4.5 environment";
+			print color('bold red')."\nFatal error : ".color('reset')."User Aborted.\n\n";
+			die "\n";
+		}
+	}elsif($post_45 && $environ == "5.8") {
+    print "You are trying to build a post 4.5 release in a pre 4.5 environment \nIs this correct ? [y/n]  ";
+		$ans = <STDIN>;
+		if( !($ans =~ /^y/i) ) {
+	  	print LOG "\nERROR : Trying to build a post 4.5 release in a pre 4.5 environment";
+			print color('bold red')."\nFatal error : ".color('reset')."User Aborted.\n\n";
+			die "\n";
+		}
+	}else {
+    print "Are the details above correct ? [y/n]  ";
+		$ans = <STDIN>;
+		if( !($ans =~ /^y/i) ) {
+	  	print LOG "\nERROR : User Aborted";
+			print color('bold red')."\nFatal error : ".color('reset')."User Aborted.\n\n";
+			die "\n";
+  	}
+  }
+}
+  $upgrade_prev = "$upgrade_path$upgrade$base_level$to$patch_prefix.$previous_patch_level$sql_ext";
+  $upgrade_next_patch_after = "$upgrade_path$upgrade$base_level$next_patch_after$patch_prefix.$previous_patch_level$sql_ext";
+  $upgrade_current = "$upgrade_path$upgrade$base_level$to$patch_prefix.$patch_level$sql_ext";
+
+  if (-e $upgrade_current) {
+      
+      if (-e $upgrade_next_patch_after) {
+	    	print color('bold red')."\nFatal error : \n".color('reset')."Upgrade script $upgrade_next_patch_after still exists - Please resolve\n\n";
+	     	die "\n" ;
+			}
+
+      if (-e $upgrade_prev) {
+	    	print color('bold red')."\nFatal error : \n".color('reset')."Upgrade script $upgrade_prev still exists - Please resolve\n\n";
+	     	die "\n";
+			}
+
+  } elsif (-e $upgrade_next_patch_after && !$just_check) {
+     	if( system("mv $upgrade_next_patch_after $upgrade_current") ) {
+      		print LOG "\nERROR : Failed to copy Upgrade script $upgrade_next_patch_after to $upgrade_current";
+      		print color('bold red')."\nFatal error : \n".color('reset')."Failed to copy upgrade script\n $upgrade_next_patch_after\nto $upgrade_current";
+					die "\n";
+			} else	{
+         	print color('bold red')."WARNING!  ".color('reset')."$upgrade$base_level$to$patch_prefix.$patch_level$sql_ext does not exist\n";
+         	print color('bold red')."RENAMED\n".color('reset')."$upgrade_next_patch_after \nto $upgrade_current\n".color('bold red')."\nPLEASE VERIFY and CHECKIN\n".color('reset');
+         	exit 0;
+			}
+  } elsif (-e $upgrade_prev && !$just_check) {
+   		if( system("mv $upgrade_prev $upgrade_current") ) {
+     			print LOG "\nERROR : Failed to copy Upgrade script $upgrade_prev to $upgrade_current";
+     			print color('bold red')."\nFatal error : \n".color('reset')."Failed to copy upgrade script $upgrade_prev\nto $upgrade_current";
+					die "\n";
+			} else	{
+         	print color('bold red')."WARNING!  ".color('reset')."$upgrade$base_level$to$patch_prefix.$patch_level$sql_ext does not exist\n";
+       	  print color('bold red')."RENAMED \n".color('reset')."$upgrade_prev \n to $upgrade_current\n".color('bold red')."\nPLEASE VERIFY and CHECKIN\n".color('reset');
+       		exit 0;
+			}
+  } else {
+      print LOG "\nERROR : No valid upgrade script exists";
+      print color('bold red')."\nFatal error : \n".color('reset')."No valid upgrade script exist. Please resolve\n";
+			die "\n";
+  }
+
+  if( $just_check ) {
+if( $automated ) {
+    print "Using Automated script, skipping manual checks\n  ";
+} else {
+    print "Have you verified that the upgrade script is in sync with all changes to the DB for patch $patch_level? [y/n]  ";
+  	$ans = <STDIN>;
+  	if( !($ans =~ /^y/i) ) {
+			print color('bold red')."\nFatal error : ".color('reset')."Run CheckPatch to perform the necessary checks and re-run this script.\n\n";
+			die "\n";
+  	} 
+ 			  exit(0);
+	}
+  } else {
+		print color('bold red')."\nSUCCESS! : ".color('reset')."$upgrade_current exists\nNow run CheckPatch \nTo verify that the upgrade script is in sync with all changes to the DB \nfor patch $patch_level\n\n";
+		die "\n";
+	}
+
+#  print "BASE_LEVEL IS ",$base_level, "\n";
+#  print "PATCH_LEVEL IS ",$patch_level, "\n";
+#  print "PATCH_PREFIX IS ",$patch_prefix, "\n";
+#  print "BASE LETTER IS ",$base_letter, "\n";
+#  print "PREV_PATCH_LEVEL IS ",$previous_patch_level, "\n";
+#  print $upgrade_prev,"\n";
+#  print $upgrade_next_patch_after,"\n";
+#  print $upgrade_current,"\n";
+
+
+exit 0;
+
+}
+
+%options = ();
+
+getopts( "axhvcr:p:l:o:", \%options );
+
+Usage() if defined $options{h};
+Version() if defined $options{v};
+$just_check = 1 if defined $options{c};
+$release = $options{r} if defined $options{r};
+$prepaid = $options{p} if defined $options{p};
+#$automated = $options{a} if defined $options{a};
+$automated = 1 if defined $options{a};
+
+print "\n\nDiarmuid - automated = $automated\n\n";
+if( $options{l} ) {
+	$log = $options{l};
+	$user_supplied_log = 1;
+} else {
+	$log = "/tmp/check_db_upgrade.log";
+}
+
+if( (!$release) || (!$prepaid) ) {
+	print "You must supply at least -r and -p and their arguments\n";
+	print "Run $self -h for usage help\n\n";
+	exit 1;
+}
+
+my $HOME = $ENV{HOME};
+my $PWD = $ENV{PWD};
+
+if( !($prepaid =~ /^\//) && !($prepaid =~ /^~/) ) {
+	if( ($prepaid =~ /^\./) && (!($prepaid =~ /^\.\./)) ) {
+		$prepaid = $PWD;
+	} elsif( -d $PWD."/".$prepaid ) {
+		$prepaid = $PWD."/".$prepaid;
+	} elsif( -d $HOME."/".$prepaid ) {
+		$prepaid = $HOME."/".$prepaid;
+	} else {
+		print "Please supply the full path to the prepaid source\n";
+		exit 1;
+	}
+}
+
+if( !$user_supplied_log ) {
+	if( -f "$log" ) {
+		print " -o- Removing $log ... ";
+		if( system("rm -f $log") ) {
+			print "Failed\n";
+			print color('bold red')."\nFatal error : ".color('reset')."Could not remove $log : $!\n\n";
+			die "\n";
+		}
+		print "Success\n";
+	}
+}
+
+print " -o- Opening $log ... ";
+if( !defined(open(LOG, ">>", $log)) ) {
+	print "Failed\n";
+	print color('bold red')."\nFatal error : ".color('reset')."Could not open $log for writing : $!\n\n";
+	die "\n";
+}
+print LOG $ENV{LOGNAME}." ".localtime()."\n";
+print LOG "\nCOMMAND : chmod 666 $log\n";
+if( system("chmod 666 $log >>$log 2>&1") ) {
+	print LOG "\nERROR : Failed to chmod $log\n";
+	print "Failed\n";
+}
+print "Success\n";
+select(LOG); $| = 1;
+
+select(STDOUT);
+
+check_db_upgrade();
+
+    
+
+print LOG "Exit Success\n";
+close(LOG);
+
+exit 0;
